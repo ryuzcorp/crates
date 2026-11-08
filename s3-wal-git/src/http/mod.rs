@@ -158,7 +158,22 @@ pub trait PushPolicy: Send + Sync + 'static {
 #[async_trait]
 pub trait GitHooks: Send + Sync + 'static {
     /// Decide whether this request may read or write `repo`.
+    ///
+    /// Prefer [`GitHooks::authorize_request`], which also receives the request
+    /// headers. This method remains for simple repository-wide policies.
     async fn authorize(&self, repo: &str, need: Access) -> Result<Grant, AuthError>;
+
+    /// Per-request authorization with the original headers. The default
+    /// delegates to [`GitHooks::authorize`]; applications that authenticate
+    /// users override this and inspect `Authorization` or cookies.
+    async fn authorize_request(
+        &self,
+        repo: &str,
+        need: Access,
+        _headers: &axum::http::HeaderMap,
+    ) -> Result<Grant, AuthError> {
+        self.authorize(repo, need).await
+    }
 
     /// Extra push rules beyond the built-in role checks (creates and
     /// fast-forwards for `push`, anything for `admin`).

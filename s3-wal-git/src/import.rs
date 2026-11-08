@@ -639,6 +639,10 @@ async fn import_snapshot<C: ManifestCodec>(
         tokio::fs::remove_dir_all(&mirror).await?;
     }
     wal.rehydrate_locked(slug).await?;
+    // From here on the mirror is ahead of the manifest. Drop the applied
+    // marker so a concurrent clone blocks on the slug lock and rebuilds
+    // instead of serving refs that were fetched but never published.
+    wal.sync().forget(slug).await;
 
     fetch_source(wal, &mirror, &source.fetch, &source.refs).await?;
     if let Some(head) = &head {

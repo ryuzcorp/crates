@@ -315,6 +315,14 @@ pub async fn write_checkpoint<C: ManifestCodec>(
             }
         }
         let seq = state.seq;
+        // Events are consumed asynchronously. Keep every log segment newer
+        // than the durable event cursor so a checkpoint never hides events a
+        // bridge has not delivered yet.
+        let event_cursor =
+            crate::events::read_cursor(wal.store().as_ref(), &wal.config().layout, slug)
+                .await
+                .map(|state| state.cursor.seq)
+                .unwrap_or(0);
         let checkpoint = build_checkpoint(&state, seq);
         let layout = &wal.config().layout;
         let refs_key = layout.checkpoint_refs_key(slug, seq);
@@ -325,7 +333,8 @@ pub async fn write_checkpoint<C: ManifestCodec>(
         let reference = CheckpointRef { seq, key, refs_key };
         let mut next = state.clone();
         next.checkpoint = Some(reference.clone());
-        next.log.retain(|segment| segment.last_seq > seq);
+        next.log
+            .retain(|segment| segment.last_seq > seq.min(event_cursor));
         let next_manifest = wal.codec().from_state(next)?;
         match wal
             .write_manifest(slug, &next_manifest, PutMode::Update(version))
@@ -487,6 +496,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_keeps_segments_newer_than_the_event_cursor() {
+        let wal = wal();
+        let manifest = RefsCodec
+            .from_state(state(
+                9,
+                &[("refs/heads/main", &"a".repeat(40))],
+                vec![segment(1, 3, 10), segment(4, 9, 20)],
+            ))
+            .unwrap();
+        wal.store()
+            .put_bytes(
+                &wal.manifest_key("demo"),
+                RefsCodec.encode(&manifest).unwrap(),
+                PutMode::Create,
+            )
+            .await
+            .unwrap();
+        wal.store()
+            .put_bytes(
+                &wal.config().layout.event_cursor_key("demo"),
+                br#"{"seq":4}"#.to_vec(),
+                PutMode::Create,
+            )
+            .await
+            .unwrap();
+
+        write_checkpoint(&wal, "demo").await.unwrap().unwrap();
+        let stored = wal.read_manifest("demo").await.unwrap().unwrap();
+        let stored = RefsCodec.state(&stored);
+        assert_eq!(stored.log.len(), 1, "{:?}", stored.log);
+        assert_eq!(stored.log[0].first_seq, 4);
+    }
+
+    #[tokio::test]
     async fn checkpoint_roundtrip_and_log_trim() {
         let wal = wal();
         let manifest = RefsCodec
@@ -503,6 +546,17 @@ mod tests {
             .put_bytes(
                 &wal.manifest_key("demo"),
                 RefsCodec.encode(&manifest).unwrap(),
+                PutMode::Create,
+            )
+            .await
+            .unwrap();
+
+        // The event cursor has consumed everything: the checkpoint may drop
+        // the folded segments.
+        wal.store()
+            .put_bytes(
+                &wal.config().layout.event_cursor_key("demo"),
+                br#"{"seq":9}"#.to_vec(),
                 PutMode::Create,
             )
             .await

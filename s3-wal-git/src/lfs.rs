@@ -44,10 +44,6 @@ const MAX_LOCK_FILE_BYTES: usize = 16 * 1024 * 1024;
 /// deterministic retries keep tests fast.
 const LOCK_CAS_ATTEMPTS: usize = 8;
 
-fn std_lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|error| error.into_inner())
-}
-
 /// LFS API error. HTTP layers map [`LfsError::status`] and
 /// [`LfsError::body`].
 #[derive(Debug, thiserror::Error)]
@@ -329,10 +325,11 @@ impl LfsStore {
                     objects.push(BatchObjectResponse {
                         oid: object.oid.clone(),
                         size: object.size,
-                        authenticated: true,
+                        // Routed hrefs need the caller's git-lfs credentials;
+                        // `authenticated: true` suppresses them.
+                        authenticated: false,
                         actions: Some(BatchActions {
                             upload: Some(self.upload_action(slug, &object.oid)),
-                            verify: Some(self.verify_action(slug, &object.oid)),
                             ..BatchActions::default()
                         }),
                         error: None,
@@ -341,7 +338,9 @@ impl LfsStore {
                 Operation::Download => match self.store.head(&key).await? {
                     Some(meta) => {
                         let action = self.download_action(&key, slug, &object.oid).await?;
-                        let authenticated = action.expires_at.is_none();
+                        // A presigned URL carries its own authorization;
+                        // a routed href needs the caller's credentials.
+                        let authenticated = action.expires_at.is_some();
                         objects.push(BatchObjectResponse {
                             oid: object.oid.clone(),
                             size: meta.size,
@@ -411,75 +410,84 @@ impl LfsStore {
             )));
         }
 
-        let digest = Arc::new(std::sync::Mutex::new(Sha256::new()));
-        let total = Arc::new(AtomicU64::new(0));
-        let declared = size;
-        let hasher = Arc::clone(&digest);
-        let counter = Arc::clone(&total);
-        let stream: ByteStream = Box::pin(body.map(move |item| {
-            let chunk = item?;
-            let seen = counter.fetch_add(chunk.len() as u64, Ordering::SeqCst) + chunk.len() as u64;
-            if seen > declared {
-                return Err(StoreError::invalid(format!(
-                    "lfs body exceeds declared {declared} bytes"
-                )));
-            }
-            std_lock(&hasher).update(&chunk);
-            Ok(chunk)
-        }));
+        // Download to a private staging file while hashing; only verified
+        // bytes are written to the content address. A failed or concurrent
+        // upload can therefore never poison the OID.
+        let tmp = crate::config::tmp_path(&format!("lfs-{slug}-{oid}"));
+        let result = async {
+            use tokio::io::AsyncWriteExt as _;
 
-        let options = PutOptions {
-            mode: PutMode::Create,
-            content_type: Some("application/octet-stream"),
-            immutable: true,
-        };
-        let body = PutBody::Stream { len: size, stream };
-        let meta = match self.store.put(&key, body, options).await {
-            Ok(meta) => meta,
-            Err(StoreError::PreconditionFailed { .. }) => {
-                // Another writer created the object between our head and put.
-                if let Some(meta) = self.store.head(&key).await? {
-                    if meta.size == size {
-                        return Ok(meta);
-                    }
-                }
-                return Err(LfsError::Invalid(format!(
-                    "concurrent write changed object {oid}"
-                )));
-            }
-            Err(error) => {
-                let _ = self.store.delete(&key, None).await;
-                let actual = total.load(Ordering::SeqCst);
-                if actual != size {
+            let mut file = tokio::fs::File::create(&tmp)
+                .await
+                .map_err(|error| LfsError::Store(error.into()))?;
+            let mut hasher = Sha256::new();
+            let mut total = 0u64;
+            let mut stream = body;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                total = total.saturating_add(chunk.len() as u64);
+                if total > size {
                     return Err(LfsError::LengthMismatch {
                         declared: size,
-                        actual,
+                        actual: total,
                     });
                 }
-                return Err(error.into());
+                hasher.update(&chunk);
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|error| LfsError::Store(error.into()))?;
             }
-        };
+            file.flush()
+                .await
+                .map_err(|error| LfsError::Store(error.into()))?;
+            file.sync_all()
+                .await
+                .map_err(|error| LfsError::Store(error.into()))?;
+            drop(file);
 
-        let actual_total = total.load(Ordering::SeqCst);
-        let actual_hash = {
-            let mut guard = std_lock(&digest);
-            let hasher = std::mem::take(&mut *guard);
-            hex::encode(hasher.finalize())
-        };
-        if actual_total != size {
-            let _ = self.store.delete(&key, None).await;
-            return Err(LfsError::LengthMismatch {
-                declared: size,
-                actual: actual_total,
-            });
+            if total != size {
+                return Err(LfsError::LengthMismatch {
+                    declared: size,
+                    actual: total,
+                });
+            }
+            let actual_hash = hex::encode(hasher.finalize());
+            if !actual_hash.eq_ignore_ascii_case(oid) {
+                return Err(LfsError::OidMismatch {
+                    oid: oid.to_string(),
+                    actual: actual_hash,
+                });
+            }
+
+            let options = PutOptions {
+                mode: PutMode::Create,
+                content_type: Some("application/octet-stream"),
+                immutable: true,
+            };
+            match self
+                .store
+                .put(&key, PutBody::File(tmp.clone()), options)
+                .await
+            {
+                Ok(meta) => Ok(meta),
+                Err(StoreError::PreconditionFailed { .. }) => {
+                    // Another verified writer won. It wrote under the same
+                    // content address, so its bytes are the object.
+                    if let Some(meta) = self.store.head(&key).await? {
+                        if meta.size == size {
+                            return Ok(meta);
+                        }
+                    }
+                    Err(LfsError::Invalid(format!(
+                        "concurrent write changed object {oid}"
+                    )))
+                }
+                Err(error) => Err(error.into()),
+            }
         }
-        if !actual_hash.eq_ignore_ascii_case(oid) {
-            let _ = self.store.delete(&key, None).await;
-            return Err(LfsError::OidMismatch {
-                oid: oid.to_string(),
-                actual: actual_hash,
-            });
-        }
+        .await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+        let meta = result?;
         crate::metrics::lfs_bytes("upload", size);
         crate::metrics::lfs_operation("upload", "ok");
         Ok(meta)
@@ -620,14 +628,6 @@ impl LfsStore {
     fn upload_action(&self, slug: &str, oid: &str) -> BatchAction {
         BatchAction {
             href: self.routed_href(slug, oid),
-            header: BTreeMap::new(),
-            expires_at: None,
-        }
-    }
-
-    fn verify_action(&self, slug: &str, oid: &str) -> BatchAction {
-        BatchAction {
-            href: format!("{}/verify", self.routed_href(slug, oid)),
             header: BTreeMap::new(),
             expires_at: None,
         }
@@ -1387,7 +1387,7 @@ mod tests {
         assert!(upload
             .href
             .starts_with("https://git.test/acme/demo/lfs/objects/"));
-        assert!(actions.verify.is_some());
+        assert!(actions.verify.is_none());
     }
 
     #[tokio::test]
@@ -1423,7 +1423,7 @@ mod tests {
             .unwrap();
         assert!(action.href.starts_with("memory://"), "{}", action.href);
         assert!(action.expires_at.is_some());
-        assert!(!response.objects[0].authenticated);
+        assert!(response.objects[0].authenticated);
     }
 
     fn create_request(path: &str) -> LockCreateRequest {

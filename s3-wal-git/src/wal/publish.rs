@@ -396,7 +396,6 @@ impl<C: ManifestCodec> Wal<C> {
                         if let Some(commit) = failure.commit.as_deref() {
                             if self.adopt_if_landed(slug, commit).await {
                                 self.sync.set_applied_seq(slug, commit.state.seq).await;
-                                self.prune(slug, &commit.state, &base_state).await;
                                 for (index, outcome) in &commit.outcomes {
                                     results[*index] = Some(Ok(outcome.clone()));
                                 }
@@ -453,7 +452,8 @@ impl<C: ManifestCodec> Wal<C> {
             )));
         }
         let accepted = self.snapshot(&bare).await?;
-        let txns = log::classify_txns(&before.refs, &accepted.refs);
+        let before_refs = self.config.filter_refs(before.refs.clone());
+        let txns = log::classify_txns(&before_refs, &accepted.refs);
         self.ensure_repo_locked(slug).await?;
         if txns.is_empty() && pack.is_none() {
             let seq = self
@@ -465,8 +465,8 @@ impl<C: ManifestCodec> Wal<C> {
                 ..RecordOutcome::default()
             });
         }
-        let moved = moved_refs(&before.refs, &accepted.refs);
-        let deleted = deleted_refs(&before.refs, &accepted.refs);
+        let moved = moved_refs(&before_refs, &accepted.refs);
+        let deleted = deleted_refs(&before_refs, &accepted.refs);
         let mut attempts = 0u32;
         loop {
             let (base_state, version) = match self.load_state(slug).await? {
@@ -557,7 +557,6 @@ impl<C: ManifestCodec> Wal<C> {
                         if let Some(commit) = failure.commit.as_deref() {
                             if self.adopt_if_landed(slug, commit).await {
                                 self.sync.set_applied_seq(slug, commit.state.seq).await;
-                                self.prune(slug, &commit.state, &base_state).await;
                                 return Ok(commit
                                     .outcomes
                                     .iter()
@@ -896,7 +895,6 @@ impl<C: ManifestCodec> Wal<C> {
         match self.write_state(slug, state.clone(), mode).await {
             Ok(_) => {
                 self.sync.set_applied_seq(slug, state.seq).await;
-                self.prune(slug, &state, base_state).await;
                 Ok(outcomes)
             }
             Err(WalError::Store(error)) if error.is_precondition_failed() => {
@@ -1006,7 +1004,9 @@ impl<C: ManifestCodec> Wal<C> {
             &bytes,
             &git::IngestOptions {
                 fsck: true,
-                max_bytes: Some(self.config.limits.max_push_bytes),
+                // This pack is server-generated from the whole repository;
+                // max_push_bytes bounds a client push, not a full repack.
+                max_bytes: None,
                 thin: true,
             },
         )
@@ -1067,53 +1067,6 @@ impl<C: ManifestCodec> Wal<C> {
         for key in objects {
             if !named.contains(key) {
                 let _ = self.store.delete(key, None).await;
-            }
-        }
-    }
-
-    async fn prune(&self, slug: &str, next: &ManifestState, old: &ManifestState) {
-        let _ = slug;
-        for entry in next.refs.values() {
-            if let Some(bundle) = &entry.bundle {
-                self.prune_bundle_prefix(bundle).await;
-            }
-        }
-        for (refname, entry) in &old.refs {
-            if next.refs.contains_key(refname) {
-                continue;
-            }
-            if let Some(bundle) = &entry.bundle {
-                self.delete_bundle_prefix(bundle).await;
-            }
-        }
-    }
-
-    async fn delete_bundle_prefix(&self, any: &str) {
-        let Some(prefix) = self.config.layout.bundle_prefix(any) else {
-            return;
-        };
-        let prefix = format!("{prefix}/");
-        let Ok(keys) = self.list_keys(&prefix).await else {
-            return;
-        };
-        for key in keys {
-            if key.ends_with(".bundle") {
-                let _ = self.store.delete(&key, None).await;
-            }
-        }
-    }
-
-    async fn prune_bundle_prefix(&self, live: &str) {
-        let Some(prefix) = self.config.layout.bundle_prefix(live) else {
-            return;
-        };
-        let prefix = format!("{prefix}/");
-        let Ok(keys) = self.list_keys(&prefix).await else {
-            return;
-        };
-        for key in keys {
-            if key != live && key.ends_with(".bundle") {
-                let _ = self.store.delete(&key, None).await;
             }
         }
     }

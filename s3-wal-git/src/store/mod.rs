@@ -586,20 +586,43 @@ pub fn file_stream(path: std::path::PathBuf) -> Result<(u64, ByteStream), StoreE
 /// Write a byte stream to `dest` atomically (tmp + rename).
 pub async fn write_stream_atomic(mut stream: ByteStream, dest: &Path) -> Result<u64, StoreError> {
     use futures::StreamExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let tmp = dest.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = tokio::fs::File::create(&tmp).await?;
-    let mut written = 0u64;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        written += chunk.len() as u64;
+    let tmp = loop {
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = dest.with_extension(format!("tmp-{}-{n}", std::process::id()));
+        match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+            .await
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let (tmp, mut file) = tmp;
+    let result = async {
+        let mut written = 0u64;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            file.write_all(&chunk).await?;
+            written += chunk.len() as u64;
+        }
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, dest).await?;
+        Ok::<u64, StoreError>(written)
     }
-    file.flush().await?;
-    file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(&tmp, dest).await?;
-    Ok(written)
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
 }

@@ -63,7 +63,11 @@ where
     if let Err(error) = state.auth.check(&headers, Access::Push) {
         return error.into_response();
     }
-    let grant = match state.hooks.authorize(&slug, Access::Push).await {
+    let grant = match state
+        .hooks
+        .authorize_request(&slug, Access::Push, &headers)
+        .await
+    {
         Ok(grant) => grant,
         Err(error) => return error.into_response(),
     };
@@ -163,8 +167,54 @@ where
         tags: &grant.tags,
         updates: &updates,
     };
-    if let Err(error) = crate::policy::evaluate_push(&policy, &context) {
-        return forbidden(error.to_string());
+    let evaluation = policy.evaluate(&context);
+    if let Some(denied) = evaluation.denials.first() {
+        return forbidden(denied.to_string());
+    }
+    for limits in &evaluation.size {
+        if let Some(max) = limits.limits.push_bytes {
+            if body.len() as u64 > max {
+                return forbidden(format!(
+                    "rule size: push of {} bytes exceeds {max} for {}",
+                    body.len(),
+                    limits.refname
+                ));
+            }
+        }
+        if limits.limits.blob_bytes.is_some() {
+            return forbidden(format!(
+                "rule size: blob limits for {} need changed-path inspection and are not enforced by this server",
+                limits.refname
+            ));
+        }
+    }
+    for limits in &evaluation.history {
+        let update = updates
+            .iter()
+            .find(|update| update.refname == limits.refname);
+        let Some(update) = update else { continue };
+        if limits.limits.allow_unrelated == Some(false) && update.force {
+            return forbidden(format!(
+                "rule history: {} must fast-forward",
+                limits.refname
+            ));
+        }
+        if let (Some(max), Some(old), Some(new)) = (
+            limits.limits.allowed_forwards,
+            update.old.as_deref(),
+            update.new.as_deref(),
+        ) {
+            let count = match crate::git::count_commits(&bare, old, new).await {
+                Ok(count) => count,
+                Err(error) => return git_response(error),
+            };
+            if count > max {
+                return forbidden(format!(
+                    "rule history: {} advances {count} commits, limit {max}",
+                    limits.refname
+                ));
+            }
+        }
     }
     if role != Role::Admin {
         for update in &updates {
@@ -246,9 +296,16 @@ where
         .map(str::to_string),
     );
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    // receive-pack mutates the mirror before the WAL commit. Drop the cache
+    // marker first so a cancellation or failed commit makes the next reader
+    // rebuild from the authoritative manifest instead of serving bare refs.
+    wal.sync().forget(&slug).await;
     let mut out = match crate::git::run_git_stdin(&argv, &body, &[], RECEIVE_TIMEOUT).await {
         Ok(out) => out,
-        Err(error) => return git_response(error),
+        Err(error) => {
+            let _ = wal.rehydrate_locked(&slug).await;
+            return git_response(error);
+        }
     };
 
     let outcome = match wal.record_push_locked(&slug, &before, ingested).await {
@@ -259,6 +316,7 @@ where
         }
         Err(error) => {
             crate::metrics::push(&slug, "error");
+            let _ = wal.rehydrate_locked(&slug).await;
             tracing::error!(%slug, error = %error, "receive-pack: WAL write failed");
             return (StatusCode::CONFLICT, format!("{error:#}")).into_response();
         }

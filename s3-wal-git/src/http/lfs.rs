@@ -35,7 +35,7 @@ where
     if let Err(error) = state.auth.check(headers, need) {
         return Err(Box::new(error.into_response()));
     }
-    if let Err(error) = state.hooks.authorize(slug, need).await {
+    if let Err(error) = state.hooks.authorize_request(slug, need, headers).await {
         return Err(Box::new(error.into_response()));
     }
     Ok(())

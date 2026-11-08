@@ -255,7 +255,9 @@ async fn deletes_remove_refs_and_bundles() {
     assert_eq!(outcome.deleted, vec!["refs/heads/main".to_string()]);
     let manifest = wal.read_manifest("demo").await.unwrap().unwrap();
     assert!(manifest.refs.is_empty());
-    assert!(keyword(&store, "git/demo/refs/heads/main").await.is_empty());
+    // Bundles are retained for readers holding the previous manifest and
+    // removed by `gc` after the retention grace.
+    assert!(!keyword(&store, "git/demo/refs/heads/main").await.is_empty());
 }
 
 async fn keyword(store: &DynStore, prefix: &str) -> Vec<String> {
@@ -296,8 +298,8 @@ async fn bundle_mode_publish_rehydrate_and_prune() {
     let second_key = refs_bundle(wal.config(), "demo", "refs/heads/main", &two);
     assert!(store.head(&second_key).await.unwrap().is_some());
     assert!(
-        store.head(&first_key).await.unwrap().is_none(),
-        "the superseded bundle is pruned after the flip"
+        store.head(&first_key).await.unwrap().is_some(),
+        "the superseded bundle waits for gc"
     );
 
     let other_dir = tempfile::tempdir().unwrap();

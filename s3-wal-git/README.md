@@ -44,7 +44,8 @@ A publish:
 3. CAS-updates the mirror refs and uploads immutable bundles/packs;
 4. writes one immutable log segment;
 5. **CAS-writes the manifest** (`Update(version)` / `Create`);
-6. prunes/retires only after the flip.
+6. retires packs after the flip; superseded bundles are left for `gc`, which
+   honors `retention_grace` so readers holding the previous manifest still win.
 
 On 412 it re-reads, revalidates every expected old OID, re-sequences and
 retries with jitter. On an ambiguous error it re-reads and adopts only a
@@ -168,6 +169,8 @@ Build the S3 CLI with `--features cli,s3`.
 - `delete_prefix` refuses empty or non-scoped prefixes.
 - Git runs with a cleared environment, its own process group and a timeout.
 - Issued pack/bundle bytes are never deleted while a live or retired manifest names them.
+- Unreferenced bundles are collected only after the retention grace; a publish
+  never deletes a bundle another host may be about to commit.
 
 ## Tests
 

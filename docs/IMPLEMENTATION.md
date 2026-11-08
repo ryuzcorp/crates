@@ -104,7 +104,10 @@ Port the rule language: groups + ordered rules; `match` keys `refs`,
 `principals`, `paths` (AND of keys, OR of values), one glob dialect (`*`, `?`,
 `**`, `^` exclusion); effects `protect` (create/update/delete/force-push,
 bypass), `history`, `size`. Named denial text. Unknown keys inside a rule are
-errors; unknown envelope keys ignored. Missing file = allow-all.
+errors; unknown envelope keys ignored. Missing file = allow-all. `group:`
+references must resolve at validation. The receive path enforces `push_bytes`
+and history limits; a `blob_bytes` rule is rejected until changed-path
+inspection is wired rather than silently ignored.
 
 ## HTTP
 
@@ -120,7 +123,9 @@ errors; unknown envelope keys ignored. Missing file = allow-all.
   when storage is pack mode.
 - LFS: batch + basic transfer routes.
 - Layers: body limit, timeout, concurrency, catch-panic, request id.
-- Auth hook trait stays `GitHooks`; add optional static-token/Basic helpers.
+- Auth hook trait stays `GitHooks`; `authorize_request` receives the request
+  headers (the default delegates to `authorize`), plus static-token/Basic
+  helpers.
 
 ## Testing rules
 

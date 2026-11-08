@@ -205,19 +205,38 @@ impl LocalRepo {
             if seen.insert(update.refname.clone(), ()).is_some() {
                 continue;
             }
-            match snapshot.refs.get(&update.refname) {
-                Some(old) => {
-                    crate::git::set_ref(&self.path, &update.refname, Some(old)).await?;
+            let current = self.head_of_ref(&update.refname).await?;
+            // Restore only what this transaction actually wrote. A ref that
+            // moved to any other value belongs to a concurrent writer and
+            // must win instead of being clobbered by our rollback.
+            let wrote = match (&update.new_sha, current.as_deref()) {
+                (Some(new), Some(cur)) => new.as_str() == cur,
+                (None, None) => true,
+                _ => false,
+            };
+            if !wrote {
+                continue;
+            }
+            let old = snapshot.refs.get(&update.refname).map(String::as_str);
+            if let Err(error) = crate::git::update_ref_cas(
+                &self.path,
+                &update.refname,
+                old,
+                update.new_sha.as_deref(),
+            )
+            .await
+            {
+                // Lost another race between the check and update-ref; the
+                // concurrent writer owns the ref now.
+                let now = self.head_of_ref(&update.refname).await?;
+                if now.as_deref() != update.new_sha.as_deref() {
+                    continue;
                 }
-                None => {
-                    crate::git::set_ref(&self.path, &update.refname, None).await?;
-                }
+                return Err(error);
             }
         }
-        if let Some(expected) = &snapshot.head {
-            if self.symbolic_head().await?.as_deref() != Some(expected.as_str()) {
-                self.set_symbolic_head(expected).await?;
-            }
+        if let Some(head) = &snapshot.head {
+            self.set_symbolic_head(head).await?;
         }
         Ok(())
     }
@@ -673,6 +692,53 @@ mod tests {
         assert_eq!(
             repo.head_of_ref("refs/heads/main").await.expect("main"),
             Some(first)
+        );
+    }
+
+    #[tokio::test]
+    async fn unconditional_delete_omits_the_old_oid() {
+        let (_dir, repo, first, _second) = seeded_repo(ObjectFormat::Sha1).await;
+        repo.apply_ref_transaction(&[set_ref("refs/heads/main", None, &first)])
+            .await
+            .expect("create main");
+        crate::git::apply_ref_transaction(
+            repo.path(),
+            &[RefUpdate {
+                refname: "refs/heads/main".to_string(),
+                expected_old: None,
+                new_sha: None,
+            }],
+        )
+        .await
+        .expect("delete");
+        assert_eq!(
+            repo.head_of_ref("refs/heads/main").await.expect("main"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_does_not_clobber_a_concurrent_value() {
+        let (_dir, repo, first, second) = seeded_repo(ObjectFormat::Sha1).await;
+        repo.apply_ref_transaction(&[set_ref("refs/heads/main", None, &first)])
+            .await
+            .expect("create main");
+        let snapshot = repo.ref_snapshot(&[]).await.expect("snapshot");
+
+        // A different writer moved main to `second`. A rollback for a
+        // transaction that targeted `first` must leave `second` alone.
+        repo.apply_ref_transaction(&[set_ref("refs/heads/main", Some(&first), &second)])
+            .await
+            .expect("move");
+        repo.restore_snapshot(
+            &snapshot,
+            &[set_ref("refs/heads/main", Some(&first), &first)],
+        )
+        .await
+        .expect("restore");
+        assert_eq!(
+            repo.head_of_ref("refs/heads/main").await.expect("main"),
+            Some(second)
         );
     }
 

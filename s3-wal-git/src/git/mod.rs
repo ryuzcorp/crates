@@ -178,6 +178,73 @@ async fn run_git_inner(
     env: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<Vec<u8>, GitError> {
+    let output = run_git_output(args, stdin, env, timeout).await?;
+    if !output.status.success() {
+        return Err(GitError::Subprocess {
+            command: format!("{args:?}"),
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        });
+    }
+    Ok(output.stdout)
+}
+
+/// Spawn git with a piped stdin/stdout for streaming responses. The caller
+/// owns the child and must keep it alive until the stdout stream ends; the
+/// process group is killed when the child is dropped.
+pub async fn spawn_git_stdin(
+    args: &[&str],
+    stdin: Vec<u8>,
+    env: &[(&str, &str)],
+) -> Result<(tokio::process::Child, tokio::process::ChildStdout), GitError> {
+    use std::os::unix::process::CommandExt;
+    use tokio::io::AsyncWriteExt as _;
+
+    let mut cmd = tokio::process::Command::new("git");
+    cmd.args(args)
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("LANG", "C.UTF-8")
+        .env("HOME", "/nonexistent")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    cmd.as_std_mut().process_group(0);
+    let mut child = cmd.spawn().map_err(|error| GitError::Other(error.into()))?;
+    if let Some(mut pipe) = child.stdin.take() {
+        tokio::spawn(async move {
+            let _ = pipe.write_all(&stdin).await;
+            let _ = pipe.shutdown().await;
+        });
+    }
+    if let Some(mut stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+        });
+    }
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Other(anyhow::anyhow!("git stdout was not piped")))?;
+    Ok((child, stdout))
+}
+
+/// Run git and return its raw output even when the exit status is non-zero.
+/// Callers that parse diagnostics (fsck) must not lose stdout on failure.
+pub async fn run_git_output(
+    args: &[&str],
+    stdin: Option<Vec<u8>>,
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<std::process::Output, GitError> {
     use std::os::unix::process::CommandExt;
 
     fn kill_group(pid: u32) {
@@ -233,14 +300,7 @@ async fn run_git_inner(
     if let Some(writer) = writer {
         let _ = writer.await;
     }
-    if !output.status.success() {
-        return Err(GitError::Subprocess {
-            command: format!("{args:?}"),
-            status: output.status.to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        });
-    }
-    Ok(output.stdout)
+    Ok(output)
 }
 
 /// Initialise a bare mirror and hide the configured refs.
@@ -329,13 +389,21 @@ pub async fn snapshot_refs(
     extra_prefixes: &[String],
 ) -> Result<RefSnapshot, GitError> {
     let git_dir = format!("--git-dir={}", bare.display());
+    // `show-ref` exits 1 when the repository has no refs, which is
+    // indistinguishable from a real failure through `run_git`. `for-each-ref`
+    // exits 0 for an empty repository and lets genuine failures propagate.
     let out = run_git(
-        &[&git_dir, "show-ref", "--heads", "--tags"],
+        &[
+            &git_dir,
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+            "refs/tags",
+        ],
         &[],
         QUICK_TIMEOUT,
     )
-    .await
-    .unwrap_or_default();
+    .await?;
     let mut refs = BTreeMap::new();
     for line in out.lines() {
         if let Some((sha, name)) = line.split_once(' ') {
@@ -353,8 +421,7 @@ pub async fn snapshot_refs(
             &[],
             QUICK_TIMEOUT,
         )
-        .await
-        .unwrap_or_default();
+        .await?;
         for line in listed.lines() {
             if let Some((sha, name)) = line.split_once(' ') {
                 refs.insert(name.trim().to_string(), sha.trim().to_lowercase());
@@ -439,6 +506,20 @@ pub async fn cas_update(
     Ok(())
 }
 
+/// Number of commits reachable from `to` but not from `from`.
+pub async fn count_commits(bare: &Path, from: &str, to: &str) -> Result<u64, GitError> {
+    let git_dir = format!("--git-dir={}", bare.display());
+    let out = run_git(
+        &[&git_dir, "rev-list", "--count", &format!("{from}..{to}")],
+        &[],
+        QUICK_TIMEOUT,
+    )
+    .await?;
+    out.trim()
+        .parse()
+        .map_err(|error| GitError::Other(anyhow::anyhow!("rev-list count: {error}")))
+}
+
 /// Atomic multi-ref update (`git update-ref --stdin`).
 pub async fn apply_ref_transaction(bare: &Path, updates: &[RefUpdate]) -> Result<(), GitError> {
     if updates.is_empty() {
@@ -456,13 +537,12 @@ pub async fn apply_ref_transaction(bare: &Path, updates: &[RefUpdate]) -> Result
                     update.expected_old.as_deref().unwrap_or("")
                 ));
             }
-            None => {
-                body.push_str(&format!(
-                    "delete {} {}\n",
-                    update.refname,
-                    update.expected_old.as_deref().unwrap_or("")
-                ));
-            }
+            None => match update.expected_old.as_deref() {
+                Some(old) => body.push_str(&format!("delete {} {old}\n", update.refname)),
+                // An empty old OID means "must not exist", which would make
+                // an unconditional delete impossible. Omit the field.
+                None => body.push_str(&format!("delete {}\n", update.refname)),
+            },
         }
     }
     body.push_str("prepare\ncommit\n");
@@ -474,6 +554,38 @@ pub async fn apply_ref_transaction(bare: &Path, updates: &[RefUpdate]) -> Result
         QUICK_TIMEOUT,
     )
     .await?;
+    Ok(())
+}
+
+/// One conditional ref update: `new` replaces `expected`, or deletes the ref
+/// when `new` is `None`. An empty `expected` means the ref must not exist.
+pub async fn update_ref_cas(
+    bare: &Path,
+    refname: &str,
+    new: Option<&str>,
+    expected: Option<&str>,
+) -> Result<(), GitError> {
+    validate_refname(refname)?;
+    let git_dir = format!("--git-dir={}", bare.display());
+    let expected = expected.unwrap_or("");
+    match new {
+        Some(new) => {
+            run_git(
+                &[&git_dir, "update-ref", refname, new, expected],
+                &[],
+                QUICK_TIMEOUT,
+            )
+            .await?
+        }
+        None => {
+            run_git(
+                &[&git_dir, "update-ref", "-d", refname, expected],
+                &[],
+                QUICK_TIMEOUT,
+            )
+            .await?
+        }
+    };
     Ok(())
 }
 

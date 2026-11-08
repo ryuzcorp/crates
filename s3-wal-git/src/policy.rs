@@ -413,6 +413,19 @@ impl Policy {
             }
         }
 
+        for group in &self.groups {
+            for member in &group.members {
+                if let Some(name) = group_reference(member) {
+                    if !group_names.contains(name) {
+                        return Err(PolicyError::Invalid(format!(
+                            "group {:?} references unknown group {:?}",
+                            group.name, name
+                        )));
+                    }
+                }
+            }
+        }
+
         let mut rule_names = BTreeSet::new();
         for rule in &self.rules {
             validate_name("rule", &rule.name)?;
@@ -423,6 +436,16 @@ impl Policy {
                 )));
             }
             validate_patterns(rule)?;
+            for spec in &rule.r#match.principals {
+                if let Some(name) = group_reference(spec) {
+                    if !group_names.contains(name) {
+                        return Err(PolicyError::Invalid(format!(
+                            "rule {:?} references unknown group {:?}",
+                            rule.name, name
+                        )));
+                    }
+                }
+            }
             match &rule.effect {
                 Effect::Protect { restricts, bypass } => {
                     if restricts.is_empty() {
@@ -436,6 +459,16 @@ impl Policy {
                             "rule {:?}: bypass contains an empty principal",
                             rule.name
                         )));
+                    }
+                    for spec in bypass {
+                        if let Some(name) = group_reference(spec) {
+                            if !group_names.contains(name) {
+                                return Err(PolicyError::Invalid(format!(
+                                    "rule {:?} bypass references unknown group {:?}",
+                                    rule.name, name
+                                )));
+                            }
+                        }
                     }
                 }
                 Effect::History { .. } | Effect::Size { .. } => {}
@@ -491,6 +524,12 @@ impl Policy {
     fn compile(&self) -> CompiledPolicy<'_> {
         CompiledPolicy::new(self)
     }
+}
+
+fn group_reference(spec: &str) -> Option<&str> {
+    spec.strip_prefix('^')
+        .unwrap_or(spec)
+        .strip_prefix("group:")
 }
 
 fn validate_name(kind: &str, name: &str) -> Result<(), PolicyError> {
@@ -1574,7 +1613,8 @@ mod tests {
     #[test]
     fn match_keys_and_or_values() {
         let policy = parse(
-            r#"{"version":1,"rules":[{
+            r#"{"version":1,"groups":[{"name":"team","members":[]}],
+                "rules":[{
                 "name":"guarded",
                 "match":{"refs":["refs/heads/main","refs/tags/**"],
                          "principals":["alice@example.com","group:team"]},
@@ -1615,30 +1655,25 @@ mod tests {
         assert!(evaluate_push(&policy, &ctx("svc:queue", &[], &updates)).is_ok());
         assert!(evaluate_push(&policy, &ctx("bob@example.com", &[], &updates)).is_err());
 
-        // A bypass naming a missing roster never admits.
-        let missing = parse(
+        // Unknown group references are rejected at load instead of silently
+        // changing the rule's meaning.
+        for json in [
             r#"{"version":1,"rules":[{"name":"lock",
                 "match":{"refs":["refs/heads/main"]},
                 "effect":{"protect":{"restricts":["update"],
                                      "bypass":["group:missing"]}}}]}"#,
-        );
-        assert!(evaluate_push(&missing, &ctx("alice@example.com", &[], &updates)).is_err());
-
-        // An unresolvable include in `match` simply does not match.
-        let inert = parse(
             r#"{"version":1,"rules":[{"name":"lock",
                 "match":{"refs":["refs/heads/main"],"principals":["group:missing"]},
                 "effect":{"protect":{"restricts":["update"]}}}]}"#,
-        );
-        assert!(evaluate_push(&inert, &ctx("alice@example.com", &[], &updates)).is_ok());
-
-        // An unresolvable exclusion still excludes.
-        let exclude = parse(
             r#"{"version":1,"rules":[{"name":"lock",
                 "match":{"refs":["refs/heads/main"],"principals":["*","^group:missing"]},
                 "effect":{"protect":{"restricts":["update"]}}}]}"#,
-        );
-        assert!(evaluate_push(&exclude, &ctx("alice@example.com", &[], &updates)).is_ok());
+        ] {
+            assert!(
+                Policy::parse(json.as_bytes()).is_err(),
+                "unknown group must fail validation: {json}"
+            );
+        }
     }
 
     #[test]

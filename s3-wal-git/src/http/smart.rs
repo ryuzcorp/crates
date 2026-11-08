@@ -9,14 +9,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
 use crate::git::protocol::{wrap_advertise, Protocol, Service};
-use crate::git::{run_git_raw, run_git_stdin, PROTOCOL_TIMEOUT};
+use crate::git::{run_git_raw, spawn_git_stdin};
 use crate::manifest::ManifestCodec;
 
 use super::auth::AuthError;
@@ -60,7 +60,7 @@ where
     if let Err(error) = state.auth.check(&headers, need) {
         return error.into_response();
     }
-    if let Err(error) = state.hooks.authorize(&slug, need).await {
+    if let Err(error) = state.hooks.authorize_request(&slug, need, &headers).await {
         return error.into_response();
     }
     let wal = state.wal();
@@ -132,7 +132,11 @@ where
     if let Err(error) = state.auth.check(&headers, Access::View) {
         return error.into_response();
     }
-    if let Err(error) = state.hooks.authorize(&slug, Access::View).await {
+    if let Err(error) = state
+        .hooks
+        .authorize_request(&slug, Access::View, &headers)
+        .await
+    {
         return error.into_response();
     }
     let wal = state.wal();
@@ -149,25 +153,44 @@ where
             .and_then(|value| value.to_str().ok()),
     );
     let env: Vec<(&str, &str)> = protocol.git_protocol_env().into_iter().collect();
-    match run_git_stdin(
+    let (child, stdout) = match spawn_git_stdin(
         &["upload-pack", "--stateless-rpc", bare_arg],
-        &body,
+        body.to_vec(),
         &env,
-        PROTOCOL_TIMEOUT,
     )
     .await
     {
-        Ok(out) => (
-            StatusCode::OK,
-            [(
-                header::CONTENT_TYPE,
-                "application/x-git-upload-pack-result".to_string(),
-            )],
-            out,
-        )
-            .into_response(),
-        Err(error) => git_response(error),
-    }
+        Ok(pair) => pair,
+        Err(error) => return git_response(error),
+    };
+    // Stream the pack instead of buffering it: a large clone must not allocate
+    // its full output, and the client should receive progress as git writes.
+    let stream = futures::stream::unfold((stdout, Some(child)), |(mut out, child)| async move {
+        use tokio::io::AsyncReadExt as _;
+        let mut buf = vec![0u8; 64 * 1024];
+        match out.read(&mut buf).await {
+            Ok(0) => {
+                if let Some(mut child) = child {
+                    let _ = child.wait().await;
+                }
+                None
+            }
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(Bytes::from(buf)), (out, child)))
+            }
+            Err(error) => Some((Err(error), (out, child))),
+        }
+    });
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/x-git-upload-pack-result".to_string(),
+        )],
+        Body::from_stream(stream),
+    )
+        .into_response()
 }
 
 /// The uniform refusal used when a hook fails; kept here so handlers do not

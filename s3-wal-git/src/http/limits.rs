@@ -167,10 +167,19 @@ struct PushLimiterInner {
 impl PushLimiter {
     pub fn new(per_repo: usize) -> Self {
         let per_repo = per_repo.max(1);
+        Self::with_global(per_repo, per_repo.saturating_mul(32).max(32))
+    }
+
+    /// A limiter with an explicit process-wide ceiling. The global limit is
+    /// always at least the per-repo limit, so one repository cannot consume
+    /// every global slot by itself.
+    pub fn with_global(per_repo: usize, global: usize) -> Self {
+        let per_repo = per_repo.max(1);
+        let global = global.max(per_repo);
         Self {
             inner: Arc::new(PushLimiterInner {
                 per_repo: DashMap::new(),
-                global: Arc::new(Semaphore::new(per_repo)),
+                global: Arc::new(Semaphore::new(global)),
                 per_repo_limit: per_repo,
             }),
         }
@@ -191,14 +200,16 @@ impl PushLimiter {
                 .or_insert_with(|| Arc::new(Semaphore::new(self.inner.per_repo_limit)));
             entry.clone()
         };
+        // Take the per-repository slot first so a push waiting behind a busy
+        // repository does not hold a global slot that other repositories need.
+        let repo = repo
+            .acquire_owned()
+            .await
+            .expect("push limiter semaphore is never closed");
         let global = self
             .inner
             .global
             .clone()
-            .acquire_owned()
-            .await
-            .expect("push limiter semaphore is never closed");
-        let repo = repo
             .acquire_owned()
             .await
             .expect("push limiter semaphore is never closed");
@@ -245,6 +256,20 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.len(), 32);
         assert!(a.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn global_limit_does_not_block_another_repository() {
+        let limiter = PushLimiter::with_global(1, 2);
+        let first = limiter.acquire("a/b").await;
+        let other = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            limiter.acquire("c/d"),
+        )
+        .await
+        .expect("a different repository must not wait on a's slot");
+        drop(other);
+        drop(first);
     }
 
     #[tokio::test]

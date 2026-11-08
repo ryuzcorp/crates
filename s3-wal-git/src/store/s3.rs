@@ -224,10 +224,12 @@ impl S3Store {
             PutMode::Create => request = request.if_none_match("*"),
             PutMode::Update(version) => request = request.if_match(version.as_str()),
         }
+        let conditional = !matches!(opts.mode, PutMode::Overwrite);
         let output = request
             .send()
             .await
-            .map_err(|error| map_sdk_error(key, error))?;
+            .map_err(|error| map_sdk_error(key, error))
+            .map_err(|error| ambiguous_conditional(key, error, conditional))?;
         let checksum = output.checksum_sha256().map(str::to_string);
         match output.e_tag() {
             Some(etag) => Ok(ObjectMeta {
@@ -353,10 +355,12 @@ impl S3Store {
             PutMode::Create => complete = complete.if_none_match("*"),
             PutMode::Update(version) => complete = complete.if_match(version.as_str()),
         }
+        let conditional = !matches!(opts.mode, PutMode::Overwrite);
         let output = complete
             .send()
             .await
-            .map_err(|error| map_sdk_error(key, error))?;
+            .map_err(|error| map_sdk_error(key, error))
+            .map_err(|error| ambiguous_conditional(key, error, conditional))?;
         let checksum = output.checksum_sha256().map(str::to_string);
         // CompleteMultipartUpload can answer 200 with an XML error body and no
         // ETag; never report that as success.
@@ -530,9 +534,11 @@ impl ObjectStore for S3Store {
             Ok(_) => Ok(()),
             Err(error) if error_status(&error) == Some(404) && if_version.is_none() => Ok(()),
             Err(error) if error_status(&error) == Some(404) => Err(StoreError::not_found(key)),
-            Err(error) => Err(self
-                .enrich_precondition(key, map_sdk_error(key, error))
-                .await),
+            Err(error) => {
+                let conditional = if_version.is_some();
+                let mapped = ambiguous_conditional(key, map_sdk_error(key, error), conditional);
+                Err(self.enrich_precondition(key, mapped).await)
+            }
         }
     }
 
@@ -696,6 +702,19 @@ fn object_meta(object: &aws_sdk_s3::types::Object) -> Result<ObjectMeta, StoreEr
         version: Version::new(etag),
         checksum: Some(etag.to_string()),
     })
+}
+
+/// A conditional mutation whose response was lost may already have applied.
+/// Reporting it as retryable would let a retry turn success into a spurious
+/// conflict, so surface the ambiguity instead.
+fn ambiguous_conditional(key: &str, error: StoreError, conditional: bool) -> StoreError {
+    if conditional && error.is_retryable() {
+        StoreError::Other(anyhow::anyhow!(
+            "ambiguous conditional write for {key}; the operation may have applied"
+        ))
+    } else {
+        error
+    }
 }
 
 fn error_status<E>(error: &SdkError<E>) -> Option<u16> {

@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use crate::config::StorageMode;
 use crate::error::{GitError, WalError};
 use crate::git::{
-    check_connectivity, ingest_pack, run_git, run_git_stdin, IngestOptions, IngestedPack,
-    PROTOCOL_TIMEOUT, QUICK_TIMEOUT,
+    check_connectivity, ingest_pack, run_git, run_git_output, run_git_stdin, IngestOptions,
+    IngestedPack, PROTOCOL_TIMEOUT, QUICK_TIMEOUT,
 };
 use crate::manifest::{ManifestCodec, ManifestState, PackKind, PackRef, RetiredPack};
 use crate::store::{ObjectStoreExt as _, PutMode};
@@ -160,28 +160,24 @@ pub async fn fsck_at<C: ManifestCodec>(
     let started = Instant::now();
     let git_dir = format!("--git-dir={}", mirror.display());
     let mut lines = Vec::new();
-    match run_git(
+    let output = run_git_output(
         &[&git_dir, "fsck", "--connectivity-only", "--no-dangling"],
+        None,
         &[],
         PROTOCOL_TIMEOUT,
     )
-    .await
-    {
-        Ok(stdout) => lines.extend(
-            stdout
+    .await?;
+    for stream in [&output.stdout, &output.stderr] {
+        lines.extend(
+            String::from_utf8_lossy(stream)
                 .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
                 .map(str::to_string),
-        ),
-        Err(GitError::Subprocess { stderr, .. }) => lines.extend(
-            stderr
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(str::to_string),
-        ),
-        Err(error) => return Err(error.into()),
+        );
+    }
+    if !output.status.success() && lines.is_empty() {
+        lines.push(format!("git fsck exited with {}", output.status));
     }
     let mut missing = BTreeSet::new();
     let mut problems = BTreeSet::new();
@@ -596,6 +592,16 @@ pub async fn gc_at<C: ManifestCodec>(
             named.insert(relative.to_string());
         }
     }
+    for bundle in state
+        .refs
+        .values()
+        .filter_map(|entry| entry.bundle.as_deref())
+    {
+        named.insert(bundle.to_string());
+        if let Some(relative) = bundle.strip_prefix(repo_prefix.as_str()) {
+            named.insert(relative.to_string());
+        }
+    }
 
     let grace_ms = wal.config().retention_grace.as_millis() as u64;
     let mut report = GcReport::default();
@@ -631,6 +637,44 @@ pub async fn gc_at<C: ManifestCodec>(
             let _ = wal.store().delete(&marker_key, None).await;
             report.deleted.push(meta.key);
         }
+    }
+
+    // Bundle keys sit under their ref path, not under `wal/`. Scan the repo
+    // prefix only for `.bundle` objects and apply the same grace period, so a
+    // superseded bundle is never deleted by a publish that another host is
+    // still racing.
+    let mut stream = wal.store().list(&repo_prefix, None);
+    while let Some(item) = stream.next().await {
+        let meta = item?;
+        if !meta.key.ends_with(".bundle") {
+            continue;
+        }
+        report.scanned += 1;
+        let relative = meta
+            .key
+            .strip_prefix(repo_prefix.as_str())
+            .unwrap_or(meta.key.as_str())
+            .to_string();
+        if named.contains(&relative) || named.contains(&meta.key) {
+            report.live += 1;
+            continue;
+        }
+        let marker_key = marker_key(&repo_prefix, &relative);
+        let Some(first_seen) = first_seen(wal, &marker_key, now).await? else {
+            report.young += 1;
+            continue;
+        };
+        if now.saturating_sub(first_seen) < grace_ms {
+            report.young += 1;
+            continue;
+        }
+        match wal.store().delete(&meta.key, None).await {
+            Ok(()) => {}
+            Err(error) if error.is_not_found() => {}
+            Err(error) => return Err(error.into()),
+        }
+        let _ = wal.store().delete(&marker_key, None).await;
+        report.deleted.push(meta.key);
     }
     Ok(report)
 }
@@ -1069,6 +1113,42 @@ mod tests {
             .await
             .unwrap();
         assert!(again.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gc_collects_superseded_bundles_after_grace() {
+        let wal = wal(StorageMode::Bundle, Duration::from_millis(1_000));
+        let layout = wal.config().layout.clone();
+        let live_sha = "a".repeat(40);
+        let old_sha = "b".repeat(40);
+        let live = layout.bundle_key("demo", "refs/heads/main", &live_sha);
+        let old = layout.bundle_key("demo", "refs/heads/main", &old_sha);
+        seed_manifest(
+            &wal,
+            ManifestState {
+                seq: 2,
+                refs: BTreeMap::from([(
+                    "refs/heads/main".to_string(),
+                    ManifestRef::bundle(live_sha.clone(), live.clone()),
+                )]),
+                ..ManifestState::default()
+            },
+        )
+        .await;
+        let store = wal.store().clone();
+        for key in [&live, &old] {
+            store
+                .put_bytes(key, b"bundle".to_vec(), PutMode::Create)
+                .await
+                .unwrap();
+        }
+
+        let first = gc_at(&wal, "demo", 10_000).await.unwrap();
+        assert!(first.deleted.is_empty(), "{first:?}");
+        let second = gc_at(&wal, "demo", 11_000).await.unwrap();
+        assert_eq!(second.deleted, vec![old.clone()], "{second:?}");
+        assert!(store.exists(&live).await.unwrap());
+        assert!(!store.exists(&old).await.unwrap());
     }
 
     #[tokio::test]
