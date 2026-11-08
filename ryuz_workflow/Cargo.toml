@@ -6,7 +6,9 @@ rust-version = "1.85"
 license = "Apache-2.0"
 description = "GitHub-Actions-style CI workflows executed in containers: a strict YAML parser and a per-job container runner."
 repository = "https://github.com/ryuzcorp/crates"
-publish = false
+readme = "README.md"
+keywords = ["ci", "workflow", "containers", "github-actions"]
+categories = ["development-tools::build-utils", "command-line-utilities"]
 
 [dependencies]
 serde_yaml_ng = "0.10"

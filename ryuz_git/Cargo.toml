@@ -6,7 +6,9 @@ rust-version = "1.85"
 license = "Apache-2.0"
 description = "S3-backed WAL git: CAS manifest, immutable log, bundle/pack storage, smart HTTP v2, policy, LFS and events."
 repository = "https://github.com/ryuzcorp/crates"
-publish = false
+readme = "README.md"
+keywords = ["git", "s3", "wal", "object-storage", "smart-http"]
+categories = ["database-implementations", "web-programming"]
 
 [dependencies]
 anyhow = "1"
