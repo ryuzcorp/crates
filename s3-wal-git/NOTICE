@@ -1,0 +1,9 @@
+s3-wal-git
+Copyright 2026 the Outer and Noite authors
+
+s3-wal-git is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The WAL format, the bare-mirror sync and the smart-HTTP adapter are derived
+from Noite's runner (https://github.com/ryuzcorp/noite,
+apps/runner/src/host/git_manifest.rs, git_http.rs, git_policy.rs) and Outer
+(https://github.com/ryuzcorp/outer, crates/outer/src/git/) — both Apache-2.0.
