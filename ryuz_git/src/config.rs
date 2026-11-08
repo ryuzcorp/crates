@@ -370,7 +370,7 @@ pub(crate) fn tmp_path(prefix: &str) -> PathBuf {
             }
         })
         .collect();
-    std::env::temp_dir().join(format!("s3-wal-git-{safe}-{}-{n}", std::process::id()))
+    std::env::temp_dir().join(format!("ryuz_git-{safe}-{}-{n}", std::process::id()))
 }
 
 #[cfg(test)]

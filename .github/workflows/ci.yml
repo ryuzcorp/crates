@@ -23,7 +23,8 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
-      - run: cargo check --locked --features cli,webhook-client
+      - run: cargo check -p ryuz_git --locked --features cli,webhook-client
+      - run: cargo check -p ryuz_workflow --locked --no-default-features
       - run: cargo build --locked --release
 
   backends:
@@ -34,4 +35,4 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: backends
-      - run: cargo check --locked --features s3,gcs
+      - run: cargo check -p ryuz_git --locked --features s3,gcs

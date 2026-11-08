@@ -226,7 +226,7 @@ pub fn v2_capabilities_for(format: ObjectFormat, server_option: bool) -> Vec<u8>
     let mut out = Vec::new();
     out.extend_from_slice(&pkt_line_str("version 2"));
     out.extend_from_slice(&pkt_line_str(&format!(
-        "agent=s3-wal-git/{}",
+        "agent=ryuz_git/{}",
         env!("CARGO_PKG_VERSION")
     )));
     out.extend_from_slice(&pkt_line_str("ls-refs=unborn"));

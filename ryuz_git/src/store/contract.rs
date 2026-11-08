@@ -5,7 +5,7 @@
 //! #[tokio::test]
 //! async fn contract() {
 //!     let store = MyStore::new();
-//!     s3_wal_git::store::contract::run(&store, "contract/").await;
+//!     ryuz_git::store::contract::run(&store, "contract/").await;
 //! }
 //! ```
 //!
