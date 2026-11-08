@@ -377,6 +377,8 @@ impl<C: ManifestCodec> Wal<C> {
                     FailureKind::Precondition => {
                         restore_refs(&bare, &before, &after.refs).await;
                         self.cleanup_orphans(slug, &failure.objects).await;
+                        crate::metrics::cas_conflict(slug);
+                        crate::metrics::cas_conflict(slug);
                         attempts += 1;
                         if attempts >= self.config.publish_retries.max(1) {
                             let error = WalError::RetryExhausted {
@@ -388,6 +390,7 @@ impl<C: ManifestCodec> Wal<C> {
                             break;
                         }
                         self.backoff(attempts).await;
+                        crate::metrics::cas_retry(slug);
                     }
                     FailureKind::Failed(error) => {
                         if let Some(commit) = failure.commit.as_deref() {
@@ -534,6 +537,8 @@ impl<C: ManifestCodec> Wal<C> {
                     FailureKind::Precondition => {
                         restore_refs(&bare, &base_refs, &after.refs).await;
                         self.cleanup_orphans(slug, &failure.objects).await;
+                        crate::metrics::cas_conflict(slug);
+                        crate::metrics::cas_conflict(slug);
                         attempts += 1;
                         if attempts >= self.config.publish_retries.max(1) {
                             let _ = self.rehydrate_locked(slug).await;
@@ -543,6 +548,7 @@ impl<C: ManifestCodec> Wal<C> {
                             });
                         }
                         self.backoff(attempts).await;
+                        crate::metrics::cas_retry(slug);
                         // Pull in the winner's manifest without dropping the
                         // objects receive-pack just indexed into this mirror.
                         self.ensure_synced_locked(slug).await?;
@@ -627,6 +633,7 @@ impl<C: ManifestCodec> Wal<C> {
                 Err(WalError::Store(error)) if error.is_precondition_failed() => {
                     self.cleanup_orphans(slug, std::slice::from_ref(&segment.key))
                         .await;
+                    crate::metrics::cas_conflict(slug);
                     attempts += 1;
                     if attempts >= self.config.publish_retries.max(1) {
                         return Err(WalError::RetryExhausted {
@@ -635,6 +642,7 @@ impl<C: ManifestCodec> Wal<C> {
                         });
                     }
                     self.backoff(attempts).await;
+                    crate::metrics::cas_retry(slug);
                 }
                 Err(error) => {
                     if let Ok(Some((current, _))) = self.load_state(slug).await {

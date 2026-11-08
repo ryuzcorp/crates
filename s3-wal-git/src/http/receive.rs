@@ -252,8 +252,13 @@ where
     };
 
     let outcome = match wal.record_push_locked(&slug, &before, ingested).await {
-        Ok(outcome) => outcome,
+        Ok(outcome) => {
+            crate::metrics::push(&slug, "ok");
+            crate::metrics::push_bytes(&slug, body.len() as u64);
+            outcome
+        }
         Err(error) => {
+            crate::metrics::push(&slug, "error");
             tracing::error!(%slug, error = %error, "receive-pack: WAL write failed");
             return (StatusCode::CONFLICT, format!("{error:#}")).into_response();
         }
