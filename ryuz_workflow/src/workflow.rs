@@ -99,6 +99,78 @@ pub struct Job {
     pub steps: Vec<Step>,
 }
 
+impl Job {
+    /// Env vars that expose this job's matrix values.
+    ///
+    /// The rule is documented and collision-safe: `RYUZ_MATRIX_` + the key
+    /// uppercased, with every character outside `[A-Z0-9_]` replaced by `_`.
+    /// Values set explicitly by workflow, job or step `env` win over these.
+    pub fn matrix_env(&self) -> BTreeMap<String, String> {
+        self.matrix
+            .iter()
+            .map(|(key, value)| (matrix_env_name(key), value.clone()))
+            .collect()
+    }
+}
+
+/// The env var name for one matrix key: `RYUZ_MATRIX_` + uppercase, with
+/// `[^A-Z0-9_]` replaced by `_` (`node-version` → `RYUZ_MATRIX_NODE_VERSION`).
+pub fn matrix_env_name(key: &str) -> String {
+    let mut name = String::from("RYUZ_MATRIX_");
+    for c in key.chars() {
+        if c.is_ascii_alphanumeric() {
+            name.push(c.to_ascii_uppercase());
+        } else {
+            name.push('_');
+        }
+    }
+    name
+}
+
+/// Env names that configure the host container CLI, the dynamic loader or the
+/// shell itself. A workflow cannot set them: they would reach the host `docker`
+/// process, not only the container.
+const RESERVED_ENV_NAMES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "SHELL",
+    "PWD",
+    "TMPDIR",
+    "IFS",
+    "ENV",
+    "BASH_ENV",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+];
+
+/// Prefixes of env names reserved for the host container CLI and loader.
+const RESERVED_ENV_PREFIXES: &[&str] = &["LD_", "DOCKER_", "CONTAINER_", "PODMAN_", "XDG_"];
+
+/// Env keys workflow, job and step `env` may set.
+///
+/// The values travel through the container CLI child's environment, so a key
+/// that configures that CLI (or the dynamic loader) would leave the container.
+/// Rejecting them keeps the host side of the call fixed; scripts can still
+/// export anything they need inside `run`.
+pub(crate) fn check_workflow_env_key(ctx: &str, key: &str) -> Result<(), Error> {
+    check_env_key(ctx, key)?;
+    let upper = key.to_ascii_uppercase();
+    if RESERVED_ENV_NAMES.contains(&upper.as_str())
+        || RESERVED_ENV_PREFIXES
+            .iter()
+            .any(|prefix| upper.starts_with(prefix))
+    {
+        return Err(Error::Config(format!(
+            "{ctx}: env key `{key}` is reserved for the host container CLI; set it inside the `run` script instead"
+        )));
+    }
+    Ok(())
+}
+
 /// `defaults.run`: values a step inherits when it does not set its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunDefaults {
@@ -247,7 +319,7 @@ fn parse_env(value: &Value, ctx: &str) -> Result<BTreeMap<String, String>, Error
     let mut env = BTreeMap::new();
     for (ek, ev) in map {
         let key = as_str(ek, &format!("{ctx} key"))?;
-        check_env_key(ctx, key)?;
+        check_workflow_env_key(ctx, key)?;
         let val = as_env_value(ev, &format!("{ctx}.{key}"))?;
         check_no_expression(&val, &format!("{ctx}.{key}"))?;
         env.insert(key.to_string(), val);
@@ -328,6 +400,15 @@ fn parse_job(base: &str, value: &Value) -> Result<Vec<Job>, Error> {
                     "{ctx}: unknown key `{other}` (expected `name`, `runs-on`, `image`, `container`, `env`, `defaults`, `timeout-minutes`, `strategy`, `steps`)"
                 )));
             }
+        }
+    }
+    let mut seen_matrix_env = BTreeMap::new();
+    for (key, _) in &matrix {
+        let env_name = matrix_env_name(key);
+        if let Some(other) = seen_matrix_env.insert(env_name.clone(), key.clone()) {
+            return Err(Error::Config(format!(
+                "{ctx}: matrix keys `{other}` and `{key}` both map to `{env_name}`"
+            )));
         }
     }
     if image.is_some() && container.is_some() {
@@ -1354,6 +1435,62 @@ mod tests {
         .expect_err("too many");
         assert!(
             err.to_string().contains("more than the 256-job cap"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn reserved_env_keys_are_rejected() {
+        for key in [
+            "PATH",
+            "HOME",
+            "docker_host",
+            "LD_PRELOAD",
+            "XDG_CACHE_HOME",
+            "https_proxy",
+            "TMPDIR",
+        ] {
+            let cfg = format!(
+                "jobs:\n  a:\n    steps:\n      - run: x\n        env:\n          {key}: v\n"
+            );
+            let err = parse(&cfg).expect_err(key);
+            assert!(
+                err.to_string()
+                    .contains("is reserved for the host container CLI"),
+                "{key}: {err}"
+            );
+        }
+        let err = parse("env: { PATH: /evil }\njobs:\n  a:\n    steps:\n      - run: x\n")
+            .expect_err("workflow env");
+        assert!(err.to_string().contains("is reserved"), "{err}");
+        // Non-reserved names are fine.
+        let workflow = parse(
+            "env: { CI: '1' }\njobs:\n  a:\n    steps:\n      - run: x\n        env: { NODE_ENV: production }\n",
+        )
+        .expect("parses");
+        assert_eq!(workflow.env.get("CI").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn matrix_env_names_are_documented_and_collision_checked() {
+        let workflow = parse(
+            "jobs:\n  build:\n    strategy:\n      matrix: { node-version: [20] }\n    steps:\n      - run: x\n",
+        )
+        .expect("parses");
+        let env = workflow.jobs[0].matrix_env();
+        assert_eq!(
+            env.get("RYUZ_MATRIX_NODE_VERSION").map(String::as_str),
+            Some("20")
+        );
+        assert_eq!(matrix_env_name("os"), "RYUZ_MATRIX_OS");
+
+        let err = parse(
+            "jobs:\n  build:\n    strategy:\n      matrix: { node-version: [1], node_version: [2] }\n    steps:\n      - run: x\n",
+        )
+        .expect_err("collision");
+        assert!(
+            err.to_string()
+                .contains("both map to `RYUZ_MATRIX_NODE_VERSION`"),
             "{err}"
         );
     }

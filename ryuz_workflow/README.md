@@ -54,6 +54,19 @@ paths and unsupported actions are config errors with their path
 | job | `name`, `runs-on`, `image`, `container`, `env`, `defaults`, `timeout-minutes`, `strategy`, `steps` |
 | step | `name`, `run`, `env`, `working-directory`, `timeout-minutes`, `shell`, `uses`, `with` |
 
+`matrix` values reach steps as env vars (`build (linux, 20)` sets
+`RYUZ_MATRIX_OS=linux`, `RYUZ_MATRIX_NODE=20`): `RYUZ_MATRIX_` + the key
+uppercased, every character outside `[A-Z0-9_]` replaced by `_`. An explicit
+`env` value of the same name wins. Two matrix keys that map to the same env
+name are a config error. `${{ matrix.x }}` stays rejected: the env var is the
+contract.
+
+`env` keys that configure the host container CLI or the dynamic loader
+(`PATH`, `HOME`, `TMPDIR`, `LD_*`, `DOCKER_*`, `CONTAINER_*`, `PODMAN_*`,
+`XDG_*`, proxy/TLS variables) are reserved and rejected: workflow values travel
+through the CLI child's environment, so those names would leave the container.
+Scripts export what they need inside `run`.
+
 `uses` supports `checkout` / `actions/checkout@…` (no-op), `cache` /
 `actions/cache@…` (no-op; `path`/`key` accepted), and `upload-artifact` /
 `actions/upload-artifact@…` (`path` required, `name` optional). `env`,
@@ -78,7 +91,8 @@ budgets.
   uid/gid with no capabilities.
 - Env values never reach argv: they are set on the CLI child and referenced as
   `-e KEY`, so `ps` and audit logs show names only. Every configured value of
-  at least 4 bytes is masked as `***` in step output.
+  at least 4 bytes is masked as `***` in step output; a multi-line value also
+  contributes each of its lines as a mask.
 - Steps run as `sh -lc <script>` (or `bash -e -o pipefail -l -c` with
   `shell: bash`) inside the container. No host shell ever interprets config
   text; any Docker-compatible CLI works via `Settings::docker_bin`.
@@ -87,9 +101,14 @@ budgets.
 - Containers carry a `ryuz_workflow.pid` label and are swept at start, so a
   killed process cannot leak them. Removal is armed from creation: dropping a
   run (cancellation, workflow timeout) spawns `rm -f` instead of leaking.
-- After a successful job, `<container>:/work/<artifact_dir>` is copied back to
+- Artifacts are copied to a fresh staging directory next to the worktree, then
+  installed with `openat`/`O_DIRECTORY|O_NOFOLLOW` + `renameat`: a symlinked
+  path component fails the install and the final entry is replaced, never
+  followed, so a checkout (or a parallel job's artifact) cannot redirect a
+  host write. Per-job copies and `uses: upload-artifact` share one install lock.
+  After a successful job, `<container>:/work/<artifact_dir>` is copied back to
   `<work>/<artifact_dir>` best-effort and `lchown`ed without following
-  symlinks. `uses: upload-artifact` copies its path the same way at any point.
+  symlinks; `Outcome::artifact_path` is set only for an install that ran.
 - The container is removed with `rm -f` whatever happened inside.
 
 ## Results
@@ -103,7 +122,11 @@ per-job success lives in the outcome:
 - `Outcome { jobs, artifacts, artifact_path }`, `Outcome::success`
 
 `Err` is reserved for a bad config/settings, a bad work dir, a disallowed image
-and a scheduler failure. `run` is `run_with_events` formatted into plain lines
+and a scheduler failure. Output lines are decoded lossily (invalid UTF-8 becomes `�` and the stream is
+still drained, so a step never blocks on a full pipe) and truncated at a
+character boundary.
+
+`run` is `run_with_events` formatted into plain lines
 (`workflow: N jobs`, `job: <name> (<image>)`, `step: <name>`, raw output,
 `job: <name> done`).
 

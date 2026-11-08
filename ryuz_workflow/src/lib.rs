@@ -49,6 +49,12 @@
 //! `working-directory`, `timeout-minutes`, `shell`, `uses`, `with`. `needs` is
 //! rejected: jobs run in file order, bounded by `max_parallel`.
 //!
+//! Matrix values are exposed to steps as `RYUZ_MATRIX_<KEY>` env vars (key
+//! uppercased, `[^A-Z0-9_]` → `_`), unless an explicit `env` of that name
+//! overrides them. `env` keys that configure the host container CLI or the
+//! dynamic loader (`PATH`, `HOME`, `LD_*`, `DOCKER_*`, …) are rejected: those
+//! names would leave the container with the CLI child's environment.
+//!
 //! # Container contract (per job)
 //!
 //! ```text
@@ -62,7 +68,8 @@
 //! {cli} exec -u 0 <name> chown -R <uid>:<gid> /work /ci-home
 //! {cli} exec --user <uid>:<gid> -w /work/<wd> -e <key>... <name> <shell> <script>
 //!   (per step; stdout/stderr streamed as Event::StepOutput)
-//! {cli} cp <name>:/work/<path> <work>/<path>   # best-effort, per job
+//! {cli} cp <name>:/work/<path> <work>/.ryuz-workflow-stage-<n>/payload
+//!   (then installed with openat/renameat, refusing symlinked components)
 //! {cli} rm -f <name>                           # always, including on drop
 //! ```
 //!

@@ -325,17 +325,15 @@ where
     for job in &jobs {
         artifacts.extend(job.artifacts.iter().cloned());
     }
-    let artifact_path = match &settings.artifact_dir {
-        Some(dir)
-            if jobs.iter().any(JobOutcome::success)
-                && tokio::fs::metadata(work_dir.join(dir))
-                    .await
-                    .is_ok_and(|m| m.is_dir()) =>
-        {
-            Some(work_dir.join(dir))
-        }
-        _ => None,
-    };
+    // Only an install this run actually performed counts: a filesystem check
+    // would follow a symlink the checkout planted at the artifact path.
+    let artifact_path = settings.artifact_dir.as_ref().and_then(|dir| {
+        let target = work_dir.join(dir);
+        jobs.iter()
+            .flat_map(|job| &job.artifacts)
+            .any(|artifact| artifact.path == target)
+            .then_some(target)
+    });
     let success = jobs.iter().all(JobOutcome::success);
     sink(Event::WorkflowFinished {
         success,
@@ -684,6 +682,9 @@ async fn run_steps(
 ///
 /// Best-effort by design: a missing path is a note, not a failure (GitHub's
 /// `upload-artifact` with `if-no-files-found: ignore`, and our deploy root).
+/// The bytes land in a staging directory first and are installed with
+/// no-follow, dirfd-relative operations, so a symlink planted in the checkout
+/// (or by a parallel job) cannot redirect the host write.
 #[allow(clippy::too_many_arguments)]
 async fn copy_out(
     settings: &Settings,
@@ -694,37 +695,55 @@ async fn copy_out(
     job: &str,
     sink: &Sink,
 ) -> Option<Artifact> {
-    let dest = PathBuf::from(work).join(path);
-    if let Some(parent) = dest.parent() {
-        if let Err(error) = tokio::fs::create_dir_all(parent).await {
-            let line = format!("artifact: cannot create {} ({error})", parent.display());
+    let work_path = Path::new(work).to_path_buf();
+    let staging = match create_staging(&work_path) {
+        Ok(dir) => dir,
+        Err(error) => {
             sink(Event::Note {
                 job: job.to_string(),
-                line,
+                line: format!("artifact: cannot create a staging dir ({error})"),
             });
             return None;
         }
-    }
+    };
+    let payload = staging.join("payload");
     let args = vec![
         "cp".to_string(),
         format!("{}:/work/{path}", container.name),
-        dest.to_string_lossy().into_owned(),
+        payload.to_string_lossy().into_owned(),
     ];
-    match cli(&settings.docker_bin, &args, &[]).await {
+    let copied = cli(&settings.docker_bin, &args, &[]).await;
+    let installed = match copied {
         Ok(_) => {
-            #[cfg(unix)]
-            if !fs_util::lchown_tree(&dest, settings.uid, settings.gid) {
-                sink(Event::Note {
-                    job: job.to_string(),
-                    line: format!("artifact: copied {path}/ but chown failed; continuing"),
-                });
+            let staged = payload.clone();
+            let root = work_path.clone();
+            let rel = path.to_string();
+            let result = tokio::task::spawn_blocking(move || {
+                // One install at a time: a parallel job's artifact must not
+                // race another's path check on the same worktree.
+                let _serialized = install_lock().lock().expect("install lock");
+                fs_util::install_artifact(&staged, &root, &rel)
+            })
+            .await;
+            match result {
+                Ok(Ok(dest)) => Some(dest),
+                Ok(Err(error)) => {
+                    sink(Event::Note {
+                        job: job.to_string(),
+                        line: format!(
+                            "artifact: refusing to install {path} ({error}); nothing was overwritten"
+                        ),
+                    });
+                    None
+                }
+                Err(error) => {
+                    sink(Event::Note {
+                        job: job.to_string(),
+                        line: format!("artifact: install task for {path} failed ({error})"),
+                    });
+                    None
+                }
             }
-            sink(Event::Artifact {
-                job: job.to_string(),
-                name: name.clone(),
-                path: dest.clone(),
-            });
-            Some(Artifact { name, path: dest })
         }
         Err(error) => {
             sink(Event::Note {
@@ -733,7 +752,46 @@ async fn copy_out(
             });
             None
         }
+    };
+    let _ = tokio::fs::remove_dir_all(&staging).await;
+    let dest = installed?;
+    #[cfg(unix)]
+    if !fs_util::lchown_tree(&dest, settings.uid, settings.gid) {
+        sink(Event::Note {
+            job: job.to_string(),
+            line: format!("artifact: copied {path}/ but chown failed; continuing"),
+        });
     }
+    sink(Event::Artifact {
+        job: job.to_string(),
+        name: name.clone(),
+        path: dest.clone(),
+    });
+    Some(Artifact { name, path: dest })
+}
+
+/// Directory outside the tenant-visible worktree namespace (a fresh, random
+/// name next to it, on the same filesystem so the install is one rename).
+fn create_staging(work: &Path) -> std::io::Result<PathBuf> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..32 {
+        let id = N.fetch_add(1, Ordering::Relaxed);
+        let dir = work.join(format!(".ryuz-workflow-stage-{}-{id}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free staging directory name",
+    ))
+}
+
+fn install_lock() -> &'static Mutex<()> {
+    static LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+    &LOCK
 }
 
 fn merged_env(
@@ -741,7 +799,7 @@ fn merged_env(
     job: &Job,
     step: &Step,
 ) -> Vec<(String, String)> {
-    let mut env = BTreeMap::new();
+    let mut env = job.matrix_env();
     env.extend(base_env.clone());
     env.extend(job.env.clone());
     env.extend(step.env.clone());
@@ -834,8 +892,8 @@ async fn stream_to_log(
     job: &str,
     label: &str,
 ) -> Result<(), ExecError> {
-    let mut out_lines = BufReader::new(stdout).lines();
-    let mut err_lines = BufReader::new(stderr).lines();
+    let mut out_lines = BufReader::new(stdout).split(b'\n');
+    let mut err_lines = BufReader::new(stderr).split(b'\n');
     let mut out_done = false;
     let mut err_done = false;
     let mut logged_bytes: u64 = 0;
@@ -843,11 +901,7 @@ async fn stream_to_log(
         if *logged_bytes >= MAX_STEP_LOG_BYTES {
             return;
         }
-        let mut line = redactor.redact(&line);
-        if line.len() > MAX_LOG_LINE_BYTES {
-            line.truncate(MAX_LOG_LINE_BYTES);
-            line.push_str("…[truncated]");
-        }
+        let line = truncate_line(redactor.redact(&line));
         *logged_bytes += line.len() as u64;
         sink(Event::StepOutput {
             job: job.to_string(),
@@ -858,21 +912,58 @@ async fn stream_to_log(
     };
     while !out_done || !err_done {
         tokio::select! {
-            line = out_lines.next_line(), if !out_done => {
+            line = out_lines.next_segment(), if !out_done => {
                 match line {
-                    Ok(Some(line)) => push(Stream::Stdout, line, &mut logged_bytes),
+                    Ok(Some(bytes)) => push(
+                        Stream::Stdout,
+                        String::from_utf8_lossy(&bytes).trim_end_matches('\r').to_string(),
+                        &mut logged_bytes,
+                    ),
                     _ => out_done = true,
                 }
             }
-            line = err_lines.next_line(), if !err_done => {
+            line = err_lines.next_segment(), if !err_done => {
                 match line {
-                    Ok(Some(line)) => push(Stream::Stderr, line, &mut logged_bytes),
+                    Ok(Some(bytes)) => push(
+                        Stream::Stderr,
+                        String::from_utf8_lossy(&bytes).trim_end_matches('\r').to_string(),
+                        &mut logged_bytes,
+                    ),
                     _ => err_done = true,
                 }
             }
         }
     }
     Ok(())
+}
+
+/// The last `max` bytes of `text`, moved forward to a character boundary so a
+/// multibyte character is never sliced.
+fn last_chars(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let mut start = text.len() - max;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &text[start..])
+}
+
+/// Trim one log line to [`MAX_LOG_LINE_BYTES`] without cutting a UTF-8
+/// character (which would panic) and mark the loss.
+fn truncate_line(line: String) -> String {
+    if line.len() <= MAX_LOG_LINE_BYTES {
+        return line;
+    }
+    let mut end = MAX_LOG_LINE_BYTES;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut line = line;
+    line.truncate(end);
+    line.push_str("…[truncated]");
+    line
 }
 
 /// Spawn the container CLI with piped output. A CLI replaced in place (a
@@ -937,10 +1028,7 @@ async fn cli(bin: &str, args: &[String], env: &[(String, String)]) -> Result<Str
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".to_string());
-        let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-        if stderr.len() > 2048 {
-            stderr = format!("…{}", &stderr[stderr.len() - 2048..]);
-        }
+        let stderr = last_chars(String::from_utf8_lossy(&output.stderr).into_owned(), 2048);
         return Err(Error::Container(format!(
             "{bin} {argv}: exit {code}: {}",
             stderr.trim()
@@ -963,6 +1051,21 @@ impl Redactor {
             .chain(base_env.values().cloned())
             .chain(job.env.values().cloned())
             .chain(job.steps.iter().flat_map(|step| step.env.values().cloned()))
+            .flat_map(|value| {
+                // Output is masked one line at a time, so a multi-line secret
+                // (a PEM key, a JSON credential file) also contributes each of
+                // its lines as its own mask.
+                let mut parts = vec![value.clone()];
+                if value.contains('\n') {
+                    parts.extend(
+                        value
+                            .lines()
+                            .map(|line| line.trim().to_string())
+                            .filter(|line| !line.is_empty()),
+                    );
+                }
+                parts
+            })
             .filter(|value| value.len() >= MIN_SECRET_BYTES)
             .collect();
         secrets.sort_by_key(|value| std::cmp::Reverse(value.len()));
@@ -1299,7 +1402,7 @@ case "$cmd" in
     case "$*" in
       *"chown -R"*) exit 0;;
     esac
-    printf 'NODE_ENV=%s FOO=%s\n' "$NODE_ENV" "$FOO" >> "$DIR/exec-env.log"
+    printf 'NODE_ENV=%s FOO=%s MATRIX=%s\n' "$NODE_ENV" "$FOO" "$RYUZ_MATRIX_NODE" >> "$DIR/exec-env.log"
     if [ -e "$DIR/step-stdout" ]; then cat "$DIR/step-stdout"; fi
     if [ -e "$DIR/step-sleep" ]; then sleep "$(cat "$DIR/step-sleep")"; fi
     if [ -e "$DIR/step-exit" ]; then exit "$(cat "$DIR/step-exit")"; fi
@@ -1484,13 +1587,15 @@ esac
             .expect("exec env");
         assert!(exec_env.contains("NODE_ENV=production"), "{exec_env}");
 
-        assert_eq!(
-            invocations[7],
-            vec![
-                "cp".to_string(),
-                format!("{container}:/work/dist"),
-                work.join("dist").to_string_lossy().into_owned(),
-            ]
+        assert_eq!(invocations[7][0], "cp");
+        assert_eq!(invocations[7][1], format!("{container}:/work/dist"));
+        assert!(
+            invocations[7][2].starts_with(
+                work.join(".ryuz-workflow-stage-")
+                    .to_string_lossy()
+                    .as_ref()
+            ),
+            "copies out to staging first: {invocations:?}"
         );
         assert_eq!(
             invocations[8],
@@ -2074,5 +2179,152 @@ esac
         );
         let artifact = outcome.artifact_path.expect("artifact");
         assert!(artifact.join("index.html").exists());
+    }
+
+    #[test]
+    fn truncation_helpers_never_split_a_character() {
+        let mut line = "a".repeat(MAX_LOG_LINE_BYTES - 1);
+        line.push('é');
+        line.push_str("tail");
+        let trimmed = truncate_line(line);
+        assert!(trimmed.ends_with("…[truncated]"), "{trimmed}");
+        assert_eq!(trimmed.len(), MAX_LOG_LINE_BYTES - 1 + "…[truncated]".len());
+
+        // The tail starts inside the second byte of `é`; it must move forward.
+        let text = format!("{}é{}", "a".repeat(2999), "b".repeat(2047));
+        let tail = last_chars(text, 2048);
+        assert!(tail.starts_with('…'), "{tail}");
+    }
+
+    #[tokio::test]
+    async fn multiline_secrets_are_masked_line_by_line() {
+        let script = fake_docker();
+        let secret = "-----BEGIN KEY-----\nsupersecretline\n-----END KEY-----";
+        write_flag(
+            &script,
+            "step-stdout",
+            "-----BEGIN KEY-----\nsupersecretline\n-----END KEY-----\n",
+        );
+        let work = work_dir("multiline");
+        let mut settings = settings_for(&script);
+        settings.env = vec![("SECRET".to_string(), secret.to_string())];
+        let workflow =
+            parse("jobs:\n  build:\n    steps:\n      - run: cat key\n").expect("parses");
+        let (events, sink) = collected();
+        let outcome = run_with_events(&settings, &work, &workflow, sink)
+            .await
+            .expect("runs");
+        assert!(outcome.success());
+        let events = events.lock().expect("event lock");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::StepOutput { line, .. } if line == "***"
+            )),
+            "{events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| format!("{event:?}").contains("supersecretline")),
+            "secret leaked: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_output_is_lossy_and_still_drained() {
+        let script = fake_docker();
+        let mut bytes = vec![0xff, b'\n'];
+        bytes.extend(std::iter::repeat_n(b'x', 200 * 1024));
+        bytes.push(b'\n');
+        std::fs::write(script.parent().expect("parent").join("step-stdout"), bytes)
+            .expect("stdout");
+        let work = work_dir("invalid-utf8");
+        let workflow =
+            parse("jobs:\n  build:\n    steps:\n      - run: cat blob\n").expect("parses");
+        let (events, sink) = collected();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_with_events(&settings_for(&script), &work, &workflow, sink),
+        )
+        .await
+        .expect("must not hang on invalid UTF-8")
+        .expect("runs");
+        assert!(outcome.success());
+        let events = events.lock().expect("event lock");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::StepOutput { line, .. } if line.contains('\u{FFFD}')
+            )),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::StepOutput { line, .. } if line.len() > 100_000
+            )),
+            "the rest of the stream was not drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_values_reach_steps_and_explicit_env_wins() {
+        let script = fake_docker();
+        let work = work_dir("matrix-env");
+        let workflow = parse(
+            "jobs:\n  build:\n    strategy: { matrix: { node: [20, 22] } }\n    steps:\n      - run: echo hi\n",
+        )
+        .expect("parses");
+        let (_lines, log) = logged();
+        run(&settings_for(&script), &work, &workflow, log)
+            .await
+            .expect("runs");
+        let exec_env = std::fs::read_to_string(script.parent().unwrap().join("exec-env.log"))
+            .expect("exec env");
+        assert!(exec_env.contains("MATRIX=20"), "{exec_env}");
+        assert!(exec_env.contains("MATRIX=22"), "{exec_env}");
+
+        let script = fake_docker();
+        let work = work_dir("matrix-override");
+        let workflow = parse(
+            "jobs:\n  build:\n    strategy: { matrix: { node: [20] } }\n    steps:\n      - run: echo hi\n        env: { RYUZ_MATRIX_NODE: explicit }\n",
+        )
+        .expect("parses");
+        let (_lines, log) = logged();
+        run(&settings_for(&script), &work, &workflow, log)
+            .await
+            .expect("runs");
+        let exec_env = std::fs::read_to_string(script.parent().unwrap().join("exec-env.log"))
+            .expect("exec env");
+        assert!(exec_env.contains("MATRIX=explicit"), "{exec_env}");
+    }
+
+    #[tokio::test]
+    async fn artifact_install_replaces_a_symlinked_destination() {
+        let script = fake_docker();
+        let work = work_dir("artifact-symlink");
+        let outside =
+            std::env::temp_dir().join(format!("ryuz-workflow-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, work.join("dist")).expect("symlink");
+        let workflow =
+            parse("jobs:\n  build:\n    steps:\n      - run: echo hi\n").expect("parses");
+        let (_events, sink) = collected();
+        let outcome = run_with_events(&settings_for(&script), &work, &workflow, sink)
+            .await
+            .expect("runs");
+        assert!(outcome.success());
+        // The link itself is replaced; nothing is written through it.
+        assert_eq!(outcome.artifact_path, Some(work.join("dist")));
+        assert!(
+            !outside.join("from-ci.txt").exists(),
+            "wrote through symlink"
+        );
+        let target = std::fs::symlink_metadata(work.join("dist")).expect("installed");
+        assert!(!target.file_type().is_symlink());
+        assert!(work.join("dist/from-ci.txt").exists());
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }
