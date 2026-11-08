@@ -75,6 +75,30 @@ wal.publish(
 .await?;
 ```
 
+### S3/R2/MinIO store
+
+```rust
+use std::sync::Arc;
+#[cfg(feature = "s3")]
+use s3_wal_git::{S3Config, S3Store};
+
+#[cfg(feature = "s3")]
+let store = Arc::new(
+    S3Store::new(
+        S3Config::new("my-bucket")
+            .with_region("auto")
+            .with_endpoint("https://<account>.r2.cloudflarestorage.com")
+            .with_path_style(true)
+            .with_credentials(access_key, secret_key, None),
+    )
+    .await?,
+);
+```
+
+Omit `with_credentials` to use the AWS provider chain. GCS uses
+`GcsStore::new(GcsConfig::new("bucket"))`. Both implement `ObjectStore` and can
+be wrapped in `Prefixed::new(store, "tenant/")`.
+
 ## Axum
 
 ```rust
@@ -117,6 +141,23 @@ cargo run --features cli --bin walgit -- --config walgit.toml ls acme/app
 cargo run --features cli --bin walgit -- compact acme/app
 cargo run --features cli --bin walgit -- fsck acme/app
 ```
+
+```toml
+[store]
+kind = "s3"                     # memory | fs | s3
+bucket = "my-bucket"
+region = "auto"
+endpoint = "http://127.0.0.1:9000"
+access_key = "..."
+secret_key = "..."
+
+[wal]
+prefix = "git"
+storage = "pack"                # bundle | pack
+repos_dir = "/data/walgit-repos"
+```
+
+Build the S3 CLI with `--features cli,s3`.
 
 ## Guarantees
 
