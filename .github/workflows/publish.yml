@@ -1,0 +1,78 @@
+name: publish
+
+# Publishes the workspace crates to crates.io through Trusted Publishing
+# (OIDC): no long-lived token lives in this repository. The first version of
+# each crate was uploaded with a token because crates.io cannot create a crate
+# through Trusted Publishing; every later version goes through this workflow.
+#
+# Prerequisites (crates.io, one-time per crate):
+#   crate settings -> Trusted Publishing -> add GitHub Actions
+#     repository: ryuzcorp/crates
+#     workflow:   publish.yml
+#     environment: (none)
+
+on:
+  workflow_dispatch:
+    inputs:
+      crate:
+        description: "Crate to publish: ryuz_workflow, ryuz_git, or all"
+        required: true
+        default: all
+        type: choice
+        options: [all, ryuz_workflow, ryuz_git]
+  push:
+    tags: ["ryuz_workflow-v*", "ryuz_git-v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Exchange the OIDC token for a crates.io publish token
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish the selected crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          TAG: ${{ github.ref_name }}
+          INPUT_CRATE: ${{ inputs.crate }}
+        run: |
+          set -euo pipefail
+          targets() {
+            if [ "$EVENT_NAME" = "push" ]; then
+              case "$TAG" in
+                ryuz_workflow-v*) echo ryuz_workflow ;;
+                ryuz_git-v*) echo ryuz_git ;;
+                *) echo "unexpected tag: $TAG" >&2; exit 1 ;;
+              esac
+            else
+              case "$INPUT_CRATE" in
+                all) printf '%s\n' ryuz_workflow ryuz_git ;;
+                ryuz_workflow|ryuz_git) echo "$INPUT_CRATE" ;;
+                *) echo "unexpected crate: $INPUT_CRATE" >&2; exit 1 ;;
+              esac
+            fi
+          }
+          for pkg in $(targets); do
+            version=$(cargo metadata --no-deps --format-version 1 \
+              | jq -r --arg p "$pkg" '.packages[] | select(.name == $p) | .version')
+            if cargo info "$pkg@$version" >/dev/null 2>&1; then
+              echo "$pkg $version is already on crates.io; skipping"
+            else
+              cargo publish -p "$pkg"
+            fi
+          done
