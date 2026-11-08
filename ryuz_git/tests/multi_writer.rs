@@ -6,8 +6,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use s3_wal_git::git::run_git;
-use s3_wal_git::{Layout, MemoryStore, RefUpdate, RefsCodec, Wal, WalConfig};
+use ryuz_git::git::run_git;
+use ryuz_git::{Layout, MemoryStore, RefUpdate, RefsCodec, Wal, WalConfig};
 
 async fn commit_on_empty_tree(bare: &Path, parent: Option<&str>) -> String {
     let git_dir = format!("--git-dir={}", bare.display());

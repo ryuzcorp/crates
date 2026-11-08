@@ -1,4 +1,4 @@
-//! `walgit` — operator CLI for an s3-wal-git repository.
+//! `walgit` — operator CLI for an ryuz_git repository.
 //!
 //! ```text
 //! walgit --config wal.toml init demo
@@ -17,23 +17,23 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
-use s3_wal_git::config::{Layout, ObjectFormat, StorageMode, WalConfig};
-use s3_wal_git::error::WalError;
-use s3_wal_git::export::{self, ExportOptions};
-use s3_wal_git::import::{self, ImportOptions};
-use s3_wal_git::manifest::RefsCodec;
-use s3_wal_git::policy::Policy;
+use ryuz_git::config::{Layout, ObjectFormat, StorageMode, WalConfig};
+use ryuz_git::error::WalError;
+use ryuz_git::export::{self, ExportOptions};
+use ryuz_git::import::{self, ImportOptions};
+use ryuz_git::manifest::RefsCodec;
+use ryuz_git::policy::Policy;
 #[cfg(feature = "s3")]
-use s3_wal_git::store::s3::{S3Config, S3Store};
-use s3_wal_git::store::{DynStore, FsStore, MemoryStore};
-use s3_wal_git::wal::maintenance::{self as maintenance, CompactOptions, FsckReport, GcReport};
-use s3_wal_git::wal::Wal;
+use ryuz_git::store::s3::{S3Config, S3Store};
+use ryuz_git::store::{DynStore, FsStore, MemoryStore};
+use ryuz_git::wal::maintenance::{self as maintenance, CompactOptions, FsckReport, GcReport};
+use ryuz_git::wal::Wal;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "walgit",
     version,
-    about = "Operate an s3-wal-git repository",
+    about = "Operate an ryuz_git repository",
     propagate_version = true
 )]
 struct Cli {
@@ -222,7 +222,7 @@ enum CliError {
     #[error(transparent)]
     Wal(#[from] WalError),
     #[error(transparent)]
-    Store(#[from] s3_wal_git::error::StoreError),
+    Store(#[from] ryuz_git::error::StoreError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -263,7 +263,7 @@ fn init_tracing(cli: &Cli) {
         _ => "trace",
     };
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(format!("walgit={level},s3_wal_git={level}")));
+        .unwrap_or_else(|_| EnvFilter::new(format!("walgit={level},ryuz_git={level}")));
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
     if cli.json {
         let _ = builder.json().try_init();

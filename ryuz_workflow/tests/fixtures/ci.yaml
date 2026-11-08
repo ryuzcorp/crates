@@ -1,0 +1,6 @@
+on: [push]
+jobs:
+  build:
+    steps:
+      - name: Build
+        run: echo build

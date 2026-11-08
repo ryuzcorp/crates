@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use s3_wal_git::manifest::{
+use ryuz_git::manifest::{
     ManifestCodec, ManifestRef, ManifestState, RefsManifest, MANIFEST_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -113,7 +113,7 @@ fn an_app_owned_format_shares_the_wal_and_keeps_its_json_shape() {
 
 #[test]
 fn the_generic_format_roundtrips_extended_state() {
-    let codec = s3_wal_git::RefsCodec;
+    let codec = ryuz_git::RefsCodec;
     let state = ManifestState {
         seq: 2,
         refs: BTreeMap::from([(

@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use s3_wal_git::http::{router, Access, AuthError, GitHooks, GitHttp, Grant};
-use s3_wal_git::{Layout, MemoryStore, RefsCodec, StorageMode, Wal, WalConfig};
+use ryuz_git::http::{router, Access, AuthError, GitHooks, GitHttp, Grant};
+use ryuz_git::{Layout, MemoryStore, RefsCodec, StorageMode, Wal, WalConfig};
 use tower::ServiceExt;
 
 struct AllowAll;

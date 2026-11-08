@@ -1,4 +1,4 @@
-# s3-wal-git
+# ryuz_git
 
 S3-backed WAL git for Rust/axum applications. A repository is a write-ahead log
 in an object store: immutable objects first, then one **conditional** manifest
@@ -59,7 +59,7 @@ filesystem, S3 and GCS ship in the crate.
 
 ```rust
 use std::sync::Arc;
-use s3_wal_git::{Layout, ObjectStore, RefsCodec, Wal, WalConfig};
+use ryuz_git::{Layout, ObjectStore, RefsCodec, Wal, WalConfig};
 
 let config = WalConfig::new("/data/git", Layout::new("git"));
 let wal = Wal::new(store, Arc::new(config), Arc::new(RefsCodec));
@@ -67,7 +67,7 @@ let wal = Wal::new(store, Arc::new(config), Arc::new(RefsCodec));
 wal.init_repo("acme/app").await?;
 wal.publish(
     "acme/app",
-    &[s3_wal_git::RefUpdate::set(
+    &[ryuz_git::RefUpdate::set(
         "refs/heads/main",
         None::<String>,
         &new_commit_sha,
@@ -81,7 +81,7 @@ wal.publish(
 ```rust
 use std::sync::Arc;
 #[cfg(feature = "s3")]
-use s3_wal_git::{S3Config, S3Store};
+use ryuz_git::{S3Config, S3Store};
 
 #[cfg(feature = "s3")]
 let store = Arc::new(
@@ -105,14 +105,14 @@ be wrapped in `Prefixed::new(store, "tenant/")`.
 ```rust
 use std::sync::Arc;
 
-let state = Arc::new(s3_wal_git::http::GitHttp::new(
+let state = Arc::new(ryuz_git::http::GitHttp::new(
     store,
     Arc::new(config),
     Arc::new(RefsCodec),
     my_hooks,
 ));
 let app = axum::Router::new()
-    .nest("/v1/git", s3_wal_git::http::router(state));
+    .nest("/v1/git", ryuz_git::http::router(state));
 ```
 
 Routes:

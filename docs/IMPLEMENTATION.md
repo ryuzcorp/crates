@@ -1,4 +1,4 @@
-# s3-wal-git 0.2 implementation contract
+# ryuz_git 0.2 implementation contract
 
 Status: foundation (`store` types, `manifest` v2, `config`, `git` core, errors)
 is in place and compiles. Everything below is the target for this branch.

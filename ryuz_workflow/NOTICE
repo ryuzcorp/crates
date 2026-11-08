@@ -1,0 +1,8 @@
+ryuz_workflow
+Copyright 2026 the Noite authors
+
+ryuz_workflow is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The workflow parser, the container-per-job runner and their tests are derived
+from Noite's runner (https://github.com/ryuzcorp/noite,
+apps/runner/src/host/ci.rs) — Apache-2.0.

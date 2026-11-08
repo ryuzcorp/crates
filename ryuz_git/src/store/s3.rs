@@ -134,7 +134,7 @@ impl S3Store {
                     secret_access_key.clone(),
                     config.session_token.clone(),
                     None,
-                    "s3-wal-git",
+                    "ryuz_git",
                 );
                 loader = loader.credentials_provider(credentials);
             }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use s3_wal_git::store::{contract, FaultStore, FsStore, MemoryStore};
+use ryuz_git::store::{contract, FaultStore, FsStore, MemoryStore};
 
 #[tokio::test]
 async fn memory_store_passes_the_contract() {
@@ -25,7 +25,7 @@ async fn fault_store_delegates_the_contract() {
 
 #[tokio::test]
 async fn prefixed_store_passes_the_contract() {
-    let inner: s3_wal_git::DynStore = Arc::new(MemoryStore::new());
-    let store = s3_wal_git::Prefixed::new(inner, "tenant/");
+    let inner: ryuz_git::DynStore = Arc::new(MemoryStore::new());
+    let store = ryuz_git::Prefixed::new(inner, "tenant/");
     contract::run(&store, "contract/").await;
 }

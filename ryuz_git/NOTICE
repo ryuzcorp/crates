@@ -1,7 +1,7 @@
-s3-wal-git
+ryuz_git
 Copyright 2026 the Outer and Noite authors
 
-s3-wal-git is licensed under the Apache License, Version 2.0 (see LICENSE).
+ryuz_git is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 The WAL format, the bare-mirror sync and the smart-HTTP adapter are derived
 from Noite's runner (https://github.com/ryuzcorp/noite,

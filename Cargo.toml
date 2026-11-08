@@ -1,5 +1,5 @@
 [workspace]
-members = ["s3-wal-git"]
+members = ["ryuz_git", "ryuz_workflow"]
 resolver = "2"
 
 [workspace.package]
